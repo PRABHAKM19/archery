@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Straight Shot – Archery</title>
+<style>
+  :root { --bg: #2a2119; --panel: #3a2e23; --ink: #f3ecd8; --muted: #c9b99a; --gold: #f2c230; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: var(--bg); color: var(--ink);
+    font-family: Georgia, "Times New Roman", serif;
+  }
+  main { width: min(980px, 100%); padding: 14px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; margin-bottom: 10px; }
+  h1 { margin: 0; font-size: clamp(1.6rem, 4vw, 2.4rem); font-style: italic; letter-spacing: 0.01em; }
+  .hud { display: flex; gap: 22px; flex-wrap: wrap; }
+  .stat { display: flex; flex-direction: column; min-width: 64px; }
+  .stat span:first-child { font-size: 0.8rem; color: var(--muted); }
+  .stat span:last-child { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #score { color: var(--gold); }
+  canvas { display: block; width: 100%; height: auto; border-radius: 6px; touch-action: none; cursor: crosshair; background: #f7d4a0; }
+  p.help { margin: 10px 2px 0; color: var(--muted); font-size: 0.95rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Straight Shot</h1>
+    <div class="hud" aria-live="polite">
+      <div class="stat"><span>Score</span><span id="score">0</span></div>
+      <div class="stat"><span>Arrows left</span><span id="arrows">10</span></div>
+      <div class="stat"><span>Wind</span><span id="wind">0.0 m/s</span></div>
+      <div class="stat"><span>Best</span><span id="best">0</span></div>
+    </div>
+  </header>
+  <canvas id="game" width="960" height="540" aria-label="Archery game"></canvas>
+  <p class="help">Drag back from the bow to set angle and power, then release. The wind pushes the arrow sideways, so aim off. The gold centre scores 10.</p>
+</main>
+
+<!-- Original TypeScript source (inert; the compiled JavaScript below is what runs) -->
+<script type="text/typescript" id="ts-source">
+(() => {
+  type Phase = "aim" | "flying" | "between" | "over";
+  interface Arrow { x: number; y: number; vx: number; vy: number; ang: number; stuck: boolean; }
+  interface Popup { text: string; x: number; y: number; life: number; color: string; }
+  interface Pull { len: number; angle: number; }
+
+  const canvas = document.getElementById("game") as HTMLCanvasElement;
+  const ctx = canvas.getContext("2d")!;
+  const $ = (id: string) => document.getElementById(id)!;
+  const W = canvas.width, H = canvas.height;
+  const GROUND = 470, GRAVITY = 700, MAX_PULL = 140, POWER = 6.5;
+  const ARROWS = 10, FACE_R = 60, IDLE_ANGLE = -0.5;
+  const BOW = { x: 130, y: 370 };
+  const RINGS = [
+    { max: 12, pts: 10, color: "#f2c230" },
+    { max: 24, pts: 8, color: "#d6453d" },
+    { max: 36, pts: 6, color: "#3a7cc0" },
+    { max: 48, pts: 4, color: "#25272b" },
+    { max: 60, pts: 2, color: "#f2eee2" },
+  ];
+
+  let phase: Phase = "aim";
+  let score = 0, best = 0, arrowsLeft = ARROWS, wind = 0, timer = 0;
+  let target = { x: 700, y: 330 };
+  let arrow: Arrow | null = null;
+  let pointer: { x: number; y: number } | null = null;
+  let dragging = false;
+  let popups: Popup[] = [];
+  const clouds = Array.from({ length: 5 }, (_, i) => ({ x: i * 220, y: 50 + (i % 3) * 45, s: 0.8 + (i % 2) * 0.5 }));
+
+  try { best = Number(localStorage.getItem("archery-best")) || 0; } catch { /* storage unavailable */ }
+
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+  function updateHud(): void {
+    $("score").textContent = String(score);
+    $("arrows").textContent = String(arrowsLeft);
+    $("best").textContent = String(best);
+    $("wind").textContent = `${wind >= 0 ? "\u2192" : "\u2190"} ${Math.abs(wind / 20).toFixed(1)} m/s`;
+  }
+
+  function randomiseShot(): void {
+    target = { x: 520 + Math.random() * 360, y: 250 + Math.random() * 150 };
+    wind = Math.round((Math.random() * 2 - 1) * 60);
+  }
+
+  function newGame(): void {
+    score = 0; arrowsLeft = ARROWS; arrow = null; popups = [];
+    randomiseShot(); phase = "aim"; updateHud();
+  }
+
+  function pull(): Pull {
+    if (!pointer) return { len: 0, angle: IDLE_ANGLE };
+    const dx = BOW.x - pointer.x, dy = BOW.y - pointer.y;
+    return { len: Math.min(Math.hypot(dx, dy), MAX_PULL), angle: Math.atan2(dy, dx) };
+  }
+
+  function shoot(p: Pull): void {
+    const speed = p.len * POWER;
+    arrow = { x: BOW.x, y: BOW.y, vx: Math.cos(p.angle) * speed, vy: Math.sin(p.angle) * speed, ang: p.angle, stuck: false };
+    phase = "flying"; arrowsLeft--; updateHud();
+  }
+
+  function finish(pts: number, text: string, color: string): void {
+    if (!arrow) return;
+    arrow.stuck = true; score += pts;
+    popups.push({ text, x: clamp(arrow.x, 60, W - 60), y: clamp(arrow.y - 30, 70, H), life: 1.3, color });
+    phase = "between"; timer = 1.1; updateHud();
+  }
+
+  function endGame(): void {
+    phase = "over";
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem("archery-best", String(best)); } catch { /* ignore */ }
+    }
+    updateHud();
+  }
+
+  function update(dt: number): void {
+    for (const c of clouds) { c.x += (wind * 0.5 + 6) * dt; if (c.x > W + 100) c.x = -120; if (c.x < -120) c.x = W + 100; }
+    for (const p of popups) { p.life -= dt; p.y -= 26 * dt; }
+    popups = popups.filter(p => p.life > 0);
+
+    if (phase === "flying" && arrow) {
+      const px = arrow.x, py = arrow.y;
+      arrow.vx += wind * dt; arrow.vy += GRAVITY * dt;
+      arrow.x += arrow.vx * dt; arrow.y += arrow.vy * dt;
+      arrow.ang = Math.atan2(arrow.vy, arrow.vx);
+      if (px < target.x && arrow.x >= target.x) {
+        const yAt = py + (arrow.y - py) * ((target.x - px) / (arrow.x - px));
+        const ring = RINGS.find(r => Math.abs(yAt - target.y) < r.max);
+        if (ring) {
+          arrow.x = target.x; arrow.y = yAt;
+          finish(ring.pts, ring.pts === 10 ? "Bullseye! +10" : `+${ring.pts}`, ring.color === "#25272b" ? "#ffffff" : ring.color);
+          return;
+        }
+      }
+      if (arrow.y >= GROUND) { arrow.y = GROUND; finish(0, "Miss", "#ffffff"); }
+      else if (arrow.x > W + 40 || arrow.x < -40) finish(0, "Miss", "#ffffff");
+    } else if (phase === "between") {
+      timer -= dt;
+      if (timer <= 0) {
+        if (arrowsLeft > 0) { arrow = null; randomiseShot(); phase = "aim"; updateHud(); }
+        else endGame();
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function hills(base: number, amp: number, freq: number, shift: number, color: string): void {
+    ctx.fillStyle = color; ctx.beginPath(); ctx.moveTo(0, H);
+    for (let x = 0; x <= W; x += 20) ctx.lineTo(x, base + Math.sin(x * freq + shift) * amp);
+    ctx.lineTo(W, H); ctx.fill();
+  }
+
+  function drawArrowShape(x: number, y: number, ang: number): void {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+    ctx.strokeStyle = "#ead9a8"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(-46, 0); ctx.lineTo(0, 0); ctx.stroke();
+    ctx.fillStyle = "#98a2ac"; ctx.beginPath(); ctx.moveTo(9, 0); ctx.lineTo(-4, -5); ctx.lineTo(-4, 5); ctx.fill();
+    ctx.fillStyle = "#d6453d";
+    ctx.beginPath(); ctx.moveTo(-46, 0); ctx.lineTo(-55, -6); ctx.lineTo(-38, 0); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-46, 0); ctx.lineTo(-55, 6); ctx.lineTo(-38, 0); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawScene(): void {
+    const sky = ctx.createLinearGradient(0, 0, 0, GROUND);
+    sky.addColorStop(0, "#f0a35e"); sky.addColorStop(0.55, "#f7d4a0"); sky.addColorStop(1, "#fbecc9");
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(255,244,214,0.9)"; ctx.beginPath(); ctx.arc(800, 120, 44, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    for (const c of clouds) for (const [dx, dy, r] of [[0, 0, 22], [24, -8, 28], [52, 0, 20]]) {
+      ctx.beginPath(); ctx.arc(c.x + dx * c.s, c.y + dy * c.s, r * c.s, 0, Math.PI * 2); ctx.fill();
+    }
+    hills(360, 30, 0.006, 1, "#b7a27a"); hills(410, 24, 0.009, 3, "#7f9a5a");
+    ctx.fillStyle = "#5f7f3f"; ctx.fillRect(0, GROUND, W, H - GROUND);
+    ctx.fillStyle = "#4c6a32"; ctx.fillRect(0, GROUND, W, 6);
+  }
+
+  function drawTarget(): void {
+    const { x, y } = target;
+    ctx.strokeStyle = "#5b3a1e"; ctx.lineWidth = 7; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(x, y + FACE_R - 6); ctx.lineTo(x - 26, GROUND); ctx.moveTo(x, y + FACE_R - 6); ctx.lineTo(x + 26, GROUND); ctx.stroke();
+    for (let i = RINGS.length - 1; i >= 0; i--) {
+      ctx.fillStyle = RINGS[i].color; ctx.beginPath(); ctx.ellipse(x, y, 10, RINGS[i].max, 0, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function drawArcher(): void {
+    const ax = BOW.x - 36;
+    ctx.strokeStyle = "#2b2622"; ctx.lineWidth = 6; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(ax, BOW.y - 42); ctx.lineTo(ax, BOW.y + 12);
+    ctx.moveTo(ax, BOW.y + 12); ctx.lineTo(ax - 14, GROUND);
+    ctx.moveTo(ax, BOW.y + 12); ctx.lineTo(ax + 12, GROUND);
+    ctx.moveTo(ax, BOW.y - 34); ctx.lineTo(BOW.x, BOW.y);
+    ctx.stroke();
+    ctx.fillStyle = "#2b2622"; ctx.beginPath(); ctx.arc(ax, BOW.y - 58, 13, 0, Math.PI * 2); ctx.fill();
+  }
+
+  function drawBow(): void {
+    const p = pull();
+    const len = dragging ? p.len : 0;
+    ctx.save(); ctx.translate(BOW.x, BOW.y); ctx.rotate(dragging ? p.angle : IDLE_ANGLE);
+    ctx.strokeStyle = "#7a4b1f"; ctx.lineWidth = 6; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, -48); ctx.quadraticCurveTo(26, 0, 0, 48); ctx.stroke();
+    ctx.strokeStyle = "#f3ecd8"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, -48); ctx.lineTo(-len, 0); ctx.lineTo(0, 48); ctx.stroke();
+    if (phase === "aim") drawArrowShape(-len + 46, 0, 0);
+    ctx.restore();
+  }
+
+  function drawPreview(): void {
+    if (!dragging) return;
+    const p = pull();
+    if (p.len < 20) return;
+    let x = BOW.x, y = BOW.y, vx = Math.cos(p.angle) * p.len * POWER, vy = Math.sin(p.angle) * p.len * POWER;
+    for (let i = 0; i < 9; i++) {
+      for (let s = 0; s < 3; s++) { vy += GRAVITY * 0.02; x += vx * 0.02; y += vy * 0.02; }
+      ctx.fillStyle = `rgba(43,38,34,${0.7 - i * 0.07})`; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function drawOverlay(): void {
+    ctx.textAlign = "center";
+    if (phase === "aim" && score === 0 && arrowsLeft === ARROWS && !dragging) {
+      ctx.fillStyle = "rgba(43,38,34,0.85)"; ctx.font = "600 22px Georgia, serif";
+      ctx.fillText("Drag down and back from the bow, then release to shoot", W / 2, 60);
+    }
+    if (phase === "over") {
+      ctx.fillStyle = "rgba(30,24,18,0.72)"; ctx.fillRect(0, 0, W, H);
+      const rank = score >= 80 ? "Master archer" : score >= 55 ? "Sharpshooter" : score >= 30 ? "Apprentice" : "Keep practising";
+      ctx.fillStyle = "#f3ecd8"; ctx.font = "700 52px Georgia, serif"; ctx.fillText(`${score} points`, W / 2, H / 2 - 20);
+      ctx.font = "italic 26px Georgia, serif"; ctx.fillText(rank, W / 2, H / 2 + 20);
+      ctx.font = "600 20px Georgia, serif"; ctx.fillText("Click or tap to play again", W / 2, H / 2 + 70);
+    }
+    for (const p of popups) {
+      ctx.globalAlpha = clamp(p.life, 0, 1); ctx.fillStyle = p.color; ctx.strokeStyle = "rgba(30,24,18,0.8)"; ctx.lineWidth = 4;
+      ctx.font = "700 28px Georgia, serif"; ctx.strokeText(p.text, p.x, p.y); ctx.fillText(p.text, p.x, p.y); ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw(): void {
+    drawScene(); drawTarget(); drawArcher(); drawPreview(); drawBow();
+    if (arrow) drawArrowShape(arrow.x, arrow.y, arrow.ang);
+    drawOverlay();
+  }
+
+  // ---------- input ----------
+  const toCanvas = (e: PointerEvent) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+  };
+  canvas.addEventListener("pointerdown", e => {
+    if (phase === "over") { newGame(); return; }
+    if (phase !== "aim") return;
+    dragging = true; pointer = toCanvas(e); canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove", e => { if (dragging) pointer = toCanvas(e); });
+  const release = () => {
+    if (!dragging) return;
+    dragging = false;
+    const p = pull(); pointer = null;
+    if (p.len >= 20) shoot(p);
+  };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", () => { dragging = false; pointer = null; });
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now: number): void {
+    const dt = Math.min((now - last) / 1000, 0.033); last = now;
+    update(dt); draw(); requestAnimationFrame(frame);
+  }
+  newGame();
+  requestAnimationFrame(frame);
+})();
+
+</script>
+<script>
+"use strict";
+(() => {
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const $ = (id) => document.getElementById(id);
+    const W = canvas.width, H = canvas.height;
+    const GROUND = 470, GRAVITY = 700, MAX_PULL = 140, POWER = 6.5;
+    const ARROWS = 10, FACE_R = 60, IDLE_ANGLE = -0.5;
+    const BOW = { x: 130, y: 370 };
+    const RINGS = [
+        { max: 12, pts: 10, color: "#f2c230" },
+        { max: 24, pts: 8, color: "#d6453d" },
+        { max: 36, pts: 6, color: "#3a7cc0" },
+        { max: 48, pts: 4, color: "#25272b" },
+        { max: 60, pts: 2, color: "#f2eee2" },
+    ];
+    let phase = "aim";
+    let score = 0, best = 0, arrowsLeft = ARROWS, wind = 0, timer = 0;
+    let target = { x: 700, y: 330 };
+    let arrow = null;
+    let pointer = null;
+    let dragging = false;
+    let popups = [];
+    const clouds = Array.from({ length: 5 }, (_, i) => ({ x: i * 220, y: 50 + (i % 3) * 45, s: 0.8 + (i % 2) * 0.5 }));
+    try {
+        best = Number(localStorage.getItem("archery-best")) || 0;
+    }
+    catch { /* storage unavailable */ }
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    function updateHud() {
+        $("score").textContent = String(score);
+        $("arrows").textContent = String(arrowsLeft);
+        $("best").textContent = String(best);
+        $("wind").textContent = `${wind >= 0 ? "\u2192" : "\u2190"} ${Math.abs(wind / 20).toFixed(1)} m/s`;
+    }
+    function randomiseShot() {
+        target = { x: 520 + Math.random() * 360, y: 250 + Math.random() * 150 };
+        wind = Math.round((Math.random() * 2 - 1) * 60);
+    }
+    function newGame() {
+        score = 0;
+        arrowsLeft = ARROWS;
+        arrow = null;
+        popups = [];
+        randomiseShot();
+        phase = "aim";
+        updateHud();
+    }
+    function pull() {
+        if (!pointer)
+            return { len: 0, angle: IDLE_ANGLE };
+        const dx = BOW.x - pointer.x, dy = BOW.y - pointer.y;
+        return { len: Math.min(Math.hypot(dx, dy), MAX_PULL), angle: Math.atan2(dy, dx) };
+    }
+    function shoot(p) {
+        const speed = p.len * POWER;
+        arrow = { x: BOW.x, y: BOW.y, vx: Math.cos(p.angle) * speed, vy: Math.sin(p.angle) * speed, ang: p.angle, stuck: false };
+        phase = "flying";
+        arrowsLeft--;
+        updateHud();
+    }
+    function finish(pts, text, color) {
+        if (!arrow)
+            return;
+        arrow.stuck = true;
+        score += pts;
+        popups.push({ text, x: clamp(arrow.x, 60, W - 60), y: clamp(arrow.y - 30, 70, H), life: 1.3, color });
+        phase = "between";
+        timer = 1.1;
+        updateHud();
+    }
+    function endGame() {
+        phase = "over";
+        if (score > best) {
+            best = score;
+            try {
+                localStorage.setItem("archery-best", String(best));
+            }
+            catch { /* ignore */ }
+        }
+        updateHud();
+    }
+    function update(dt) {
+        for (const c of clouds) {
+            c.x += (wind * 0.5 + 6) * dt;
+            if (c.x > W + 100)
+                c.x = -120;
+            if (c.x < -120)
+                c.x = W + 100;
+        }
+        for (const p of popups) {
+            p.life -= dt;
+            p.y -= 26 * dt;
+        }
+        popups = popups.filter(p => p.life > 0);
+        if (phase === "flying" && arrow) {
+            const px = arrow.x, py = arrow.y;
+            arrow.vx += wind * dt;
+            arrow.vy += GRAVITY * dt;
+            arrow.x += arrow.vx * dt;
+            arrow.y += arrow.vy * dt;
+            arrow.ang = Math.atan2(arrow.vy, arrow.vx);
+            if (px < target.x && arrow.x >= target.x) {
+                const yAt = py + (arrow.y - py) * ((target.x - px) / (arrow.x - px));
+                const ring = RINGS.find(r => Math.abs(yAt - target.y) < r.max);
+                if (ring) {
+                    arrow.x = target.x;
+                    arrow.y = yAt;
+                    finish(ring.pts, ring.pts === 10 ? "Bullseye! +10" : `+${ring.pts}`, ring.color === "#25272b" ? "#ffffff" : ring.color);
+                    return;
+                }
+            }
+            if (arrow.y >= GROUND) {
+                arrow.y = GROUND;
+                finish(0, "Miss", "#ffffff");
+            }
+            else if (arrow.x > W + 40 || arrow.x < -40)
+                finish(0, "Miss", "#ffffff");
+        }
+        else if (phase === "between") {
+            timer -= dt;
+            if (timer <= 0) {
+                if (arrowsLeft > 0) {
+                    arrow = null;
+                    randomiseShot();
+                    phase = "aim";
+                    updateHud();
+                }
+                else
+                    endGame();
+            }
+        }
+    }
+    // ---------- drawing ----------
+    function hills(base, amp, freq, shift, color) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(0, H);
+        for (let x = 0; x <= W; x += 20)
+            ctx.lineTo(x, base + Math.sin(x * freq + shift) * amp);
+        ctx.lineTo(W, H);
+        ctx.fill();
+    }
+    function drawArrowShape(x, y, ang) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(ang);
+        ctx.strokeStyle = "#ead9a8";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(-46, 0);
+        ctx.lineTo(0, 0);
+        ctx.stroke();
+        ctx.fillStyle = "#98a2ac";
+        ctx.beginPath();
+        ctx.moveTo(9, 0);
+        ctx.lineTo(-4, -5);
+        ctx.lineTo(-4, 5);
+        ctx.fill();
+        ctx.fillStyle = "#d6453d";
+        ctx.beginPath();
+        ctx.moveTo(-46, 0);
+        ctx.lineTo(-55, -6);
+        ctx.lineTo(-38, 0);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(-46, 0);
+        ctx.lineTo(-55, 6);
+        ctx.lineTo(-38, 0);
+        ctx.fill();
+        ctx.restore();
+    }
+    function drawScene() {
+        const sky = ctx.createLinearGradient(0, 0, 0, GROUND);
+        sky.addColorStop(0, "#f0a35e");
+        sky.addColorStop(0.55, "#f7d4a0");
+        sky.addColorStop(1, "#fbecc9");
+        ctx.fillStyle = sky;
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(255,244,214,0.9)";
+        ctx.beginPath();
+        ctx.arc(800, 120, 44, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        for (const c of clouds)
+            for (const [dx, dy, r] of [[0, 0, 22], [24, -8, 28], [52, 0, 20]]) {
+                ctx.beginPath();
+                ctx.arc(c.x + dx * c.s, c.y + dy * c.s, r * c.s, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        hills(360, 30, 0.006, 1, "#b7a27a");
+        hills(410, 24, 0.009, 3, "#7f9a5a");
+        ctx.fillStyle = "#5f7f3f";
+        ctx.fillRect(0, GROUND, W, H - GROUND);
+        ctx.fillStyle = "#4c6a32";
+        ctx.fillRect(0, GROUND, W, 6);
+    }
+    function drawTarget() {
+        const { x, y } = target;
+        ctx.strokeStyle = "#5b3a1e";
+        ctx.lineWidth = 7;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(x, y + FACE_R - 6);
+        ctx.lineTo(x - 26, GROUND);
+        ctx.moveTo(x, y + FACE_R - 6);
+        ctx.lineTo(x + 26, GROUND);
+        ctx.stroke();
+        for (let i = RINGS.length - 1; i >= 0; i--) {
+            ctx.fillStyle = RINGS[i].color;
+            ctx.beginPath();
+            ctx.ellipse(x, y, 10, RINGS[i].max, 0, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+    function drawArcher() {
+        const ax = BOW.x - 36;
+        ctx.strokeStyle = "#2b2622";
+        ctx.lineWidth = 6;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(ax, BOW.y - 42);
+        ctx.lineTo(ax, BOW.y + 12);
+        ctx.moveTo(ax, BOW.y + 12);
+        ctx.lineTo(ax - 14, GROUND);
+        ctx.moveTo(ax, BOW.y + 12);
+        ctx.lineTo(ax + 12, GROUND);
+        ctx.moveTo(ax, BOW.y - 34);
+        ctx.lineTo(BOW.x, BOW.y);
+        ctx.stroke();
+        ctx.fillStyle = "#2b2622";
+        ctx.beginPath();
+        ctx.arc(ax, BOW.y - 58, 13, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    function drawBow() {
+        const p = pull();
+        const len = dragging ? p.len : 0;
+        ctx.save();
+        ctx.translate(BOW.x, BOW.y);
+        ctx.rotate(dragging ? p.angle : IDLE_ANGLE);
+        ctx.strokeStyle = "#7a4b1f";
+        ctx.lineWidth = 6;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(0, -48);
+        ctx.quadraticCurveTo(26, 0, 0, 48);
+        ctx.stroke();
+        ctx.strokeStyle = "#f3ecd8";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, -48);
+        ctx.lineTo(-len, 0);
+        ctx.lineTo(0, 48);
+        ctx.stroke();
+        if (phase === "aim")
+            drawArrowShape(-len + 46, 0, 0);
+        ctx.restore();
+    }
+    function drawPreview() {
+        if (!dragging)
+            return;
+        const p = pull();
+        if (p.len < 20)
+            return;
+        let x = BOW.x, y = BOW.y, vx = Math.cos(p.angle) * p.len * POWER, vy = Math.sin(p.angle) * p.len * POWER;
+        for (let i = 0; i < 9; i++) {
+            for (let s = 0; s < 3; s++) {
+                vy += GRAVITY * 0.02;
+                x += vx * 0.02;
+                y += vy * 0.02;
+            }
+            ctx.fillStyle = `rgba(43,38,34,${0.7 - i * 0.07})`;
+            ctx.beginPath();
+            ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+    function drawOverlay() {
+        ctx.textAlign = "center";
+        if (phase === "aim" && score === 0 && arrowsLeft === ARROWS && !dragging) {
+            ctx.fillStyle = "rgba(43,38,34,0.85)";
+            ctx.font = "600 22px Georgia, serif";
+            ctx.fillText("Drag down and back from the bow, then release to shoot", W / 2, 60);
+        }
+        if (phase === "over") {
+            ctx.fillStyle = "rgba(30,24,18,0.72)";
+            ctx.fillRect(0, 0, W, H);
+            const rank = score >= 80 ? "Master archer" : score >= 55 ? "Sharpshooter" : score >= 30 ? "Apprentice" : "Keep practising";
+            ctx.fillStyle = "#f3ecd8";
+            ctx.font = "700 52px Georgia, serif";
+            ctx.fillText(`${score} points`, W / 2, H / 2 - 20);
+            ctx.font = "italic 26px Georgia, serif";
+            ctx.fillText(rank, W / 2, H / 2 + 20);
+            ctx.font = "600 20px Georgia, serif";
+            ctx.fillText("Click or tap to play again", W / 2, H / 2 + 70);
+        }
+        for (const p of popups) {
+            ctx.globalAlpha = clamp(p.life, 0, 1);
+            ctx.fillStyle = p.color;
+            ctx.strokeStyle = "rgba(30,24,18,0.8)";
+            ctx.lineWidth = 4;
+            ctx.font = "700 28px Georgia, serif";
+            ctx.strokeText(p.text, p.x, p.y);
+            ctx.fillText(p.text, p.x, p.y);
+            ctx.globalAlpha = 1;
+        }
+    }
+    function draw() {
+        drawScene();
+        drawTarget();
+        drawArcher();
+        drawPreview();
+        drawBow();
+        if (arrow)
+            drawArrowShape(arrow.x, arrow.y, arrow.ang);
+        drawOverlay();
+    }
+    // ---------- input ----------
+    const toCanvas = (e) => {
+        const r = canvas.getBoundingClientRect();
+        return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+    };
+    canvas.addEventListener("pointerdown", e => {
+        if (phase === "over") {
+            newGame();
+            return;
+        }
+        if (phase !== "aim")
+            return;
+        dragging = true;
+        pointer = toCanvas(e);
+        canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener("pointermove", e => { if (dragging)
+        pointer = toCanvas(e); });
+    const release = () => {
+        if (!dragging)
+            return;
+        dragging = false;
+        const p = pull();
+        pointer = null;
+        if (p.len >= 20)
+            shoot(p);
+    };
+    canvas.addEventListener("pointerup", release);
+    canvas.addEventListener("pointercancel", () => { dragging = false; pointer = null; });
+    // ---------- loop ----------
+    let last = performance.now();
+    function frame(now) {
+        const dt = Math.min((now - last) / 1000, 0.033);
+        last = now;
+        update(dt);
+        draw();
+        requestAnimationFrame(frame);
+    }
+    newGame();
+    requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
